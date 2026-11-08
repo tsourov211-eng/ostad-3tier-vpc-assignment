@@ -1,0 +1,431 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Nginx public web tier, private Node.js API, and private MariaDB database.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing custom VPC.
+  InternetGatewayId:
+    Type: String
+    AllowedPattern: "^igw-[0-9a-f]+$"
+    Description: Internet Gateway already attached to the custom VPC.
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing public subnet with a route to the Internet Gateway.
+  AppSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing private application subnet.
+  DatabaseSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing private database subnet.
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    MaxLength: 41
+    AllowedPattern: "^[A-Za-z0-9]+$"
+    ConstraintDescription: Use 20-41 letters and digits.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 x86_64 AMI.
+
+Resources:
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: ostad-3tier-public-rt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: PublicSubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGatewayId
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetId
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: ostad-3tier-private-rt
+
+  PrivateAppSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetId
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateDatabaseSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnetId
+      RouteTableId: !Ref PrivateRouteTable
+
+  NatAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: ostad-3tier-nat-eip
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: PublicDefaultRoute
+    Properties:
+      AllocationId: !GetAtt NatAddress.AllocationId
+      SubnetId: !Ref PublicSubnetId
+      Tags:
+        - Key: Name
+          Value: ostad-3tier-nat
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP ingress to Nginx only.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ostad-3tier-web-sg
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API ingress only from the Nginx web tier.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+      Tags:
+        - Key: Name
+          Value: ostad-3tier-app-sg
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MariaDB ingress only from the API tier.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: ostad-3tier-db-sg
+
+  DatabaseInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: PrivateDefaultRoute
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref DatabaseSubnetId
+      PrivateIpAddress: 10.0.3.12
+      SecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y mariadb105-server
+            cat > /etc/my.cnf.d/ostad-assignment.cnf <<'CNF'
+            [mysqld]
+            bind-address=0.0.0.0
+            CNF
+            systemctl enable --now mariadb
+            for attempt in $(seq 1 60); do
+              mysqladmin ping --silent && break
+              sleep 5
+            done
+            mysql -u root <<'SQL'
+            CREATE DATABASE IF NOT EXISTS todoapp;
+            CREATE TABLE IF NOT EXISTS todoapp.records (
+              id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+              title VARCHAR(200) NOT NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE USER IF NOT EXISTS 'todoapp'@'10.0.2.%' IDENTIFIED BY '${DatabasePassword}';
+            ALTER USER 'todoapp'@'10.0.2.%' IDENTIFIED BY '${DatabasePassword}';
+            GRANT SELECT, INSERT, UPDATE, DELETE ON todoapp.* TO 'todoapp'@'10.0.2.%';
+            FLUSH PRIVILEGES;
+            SQL
+      Tags:
+        - Key: Name
+          Value: ostad-3tier-database
+
+  AppInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DatabaseInstance
+      - PrivateDefaultRoute
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref AppSubnetId
+      PrivateIpAddress: 10.0.2.13
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y nodejs
+            mkdir -p /opt/todo-api
+            cat > /opt/todo-api/package.json <<'JSON'
+            {"name":"ostad-todo-api","version":"1.0.0","private":true,"dependencies":{"express":"^4.21.2","mysql2":"^3.14.0"}}
+            JSON
+            cat > /opt/todo-api/server.js <<'JS'
+            const express = require('express');
+            const mysql = require('mysql2/promise');
+            const app = express();
+            const pool = mysql.createPool({
+              host: process.env.DB_HOST,
+              user: process.env.DB_USER,
+              password: process.env.DB_PASSWORD,
+              database: process.env.DB_NAME,
+              waitForConnections: true,
+              connectionLimit: 5
+            });
+            app.use(express.json({ limit: '16kb' }));
+            app.get('/api/health', async (_req, res, next) => {
+              try {
+                await pool.query('SELECT 1');
+                res.json({ status: 'ok' });
+              } catch (error) { next(error); }
+            });
+            app.get('/api/records', async (_req, res, next) => {
+              try {
+                const [rows] = await pool.query('SELECT id, title, created_at FROM records ORDER BY id DESC');
+                res.json(rows);
+              } catch (error) { next(error); }
+            });
+            app.post('/api/records', async (req, res, next) => {
+              const title = typeof req.body.title === 'string' ? req.body.title.trim() : '';
+              if (!title || title.length > 200) return res.status(400).json({ error: 'Title must contain 1-200 characters.' });
+              try {
+                const [result] = await pool.execute('INSERT INTO records (title) VALUES (?)', [title]);
+                res.status(201).json({ id: result.insertId, title: title });
+              } catch (error) { next(error); }
+            });
+            app.use((error, _req, res, _next) => {
+              console.error(error);
+              res.status(500).json({ error: 'The application could not complete the request.' });
+            });
+            async function start() {
+              for (let attempt = 1; attempt <= 60; attempt += 1) {
+                try {
+                  await pool.query('SELECT 1');
+                  app.listen(3000, '0.0.0.0', () => console.log('Todo API listening on port 3000'));
+                  return;
+                } catch (error) {
+                  console.error('Waiting for database (' + attempt + '/60): ' + error.message);
+                  await new Promise(resolve => setTimeout(resolve, 5000));
+                }
+              }
+              process.exit(1);
+            }
+            start();
+            JS
+            useradd --system --home-dir /opt/todo-api --shell /sbin/nologin todo-api
+            cd /opt/todo-api
+            npm install --omit=dev
+            chown -R todo-api:todo-api /opt/todo-api
+            cat > /etc/todo-api.env <<'ENV'
+            DB_HOST=10.0.3.12
+            DB_USER=todoapp
+            DB_PASSWORD=${DatabasePassword}
+            DB_NAME=todoapp
+            ENV
+            chown root:todo-api /etc/todo-api.env
+            chmod 640 /etc/todo-api.env
+            cat > /etc/systemd/system/todo-api.service <<'UNIT'
+            [Unit]
+            Description=Ostad three-tier Todo API
+            After=network-online.target
+            Wants=network-online.target
+            [Service]
+            Type=simple
+            User=todo-api
+            Group=todo-api
+            WorkingDirectory=/opt/todo-api
+            EnvironmentFile=/etc/todo-api.env
+            ExecStart=/usr/bin/node /opt/todo-api/server.js
+            Restart=always
+            RestartSec=5
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable --now todo-api
+      Tags:
+        - Key: Name
+          Value: ostad-3tier-application
+
+  WebInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - AppInstance
+      - PublicDefaultRoute
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref PublicSubnetId
+      PrivateIpAddress: 10.0.1.13
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y nginx
+            cat > /usr/share/nginx/html/index.html <<'HTML'
+            <!doctype html>
+            <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>Three-Tier Todo</title>
+              <style>
+                body { font: 16px system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; color: #172033; }
+                h1 { color: #124e78; } form { display: flex; gap: .5rem; } input { flex: 1; padding: .7rem; }
+                button { padding: .7rem 1rem; background: #146c94; color: white; border: 0; cursor: pointer; }
+                li { padding: .6rem 0; border-bottom: 1px solid #ddd; } #status { min-height: 1.5rem; }
+              </style>
+            </head>
+            <body>
+              <h1>Three-Tier Todo</h1>
+              <p>Nginx web tier &rarr; private API tier &rarr; private MariaDB database.</p>
+              <form id="record-form">
+                <input id="title" maxlength="200" required placeholder="Add a record">
+                <button type="submit">Add record</button>
+              </form>
+              <p id="status" role="status"></p>
+              <ul id="records"></ul>
+              <script>
+                const list = document.getElementById('records');
+                const status = document.getElementById('status');
+                async function loadRecords() {
+                  const response = await fetch('/api/records');
+                  if (!response.ok) throw new Error('Could not load records.');
+                  const records = await response.json();
+                  list.replaceChildren();
+                  records.forEach(record => {
+                    const item = document.createElement('li');
+                    item.textContent = record.title + ' &mdash; ' + new Date(record.created_at).toLocaleString();
+                    list.appendChild(item);
+                  });
+                }
+                document.getElementById('record-form').addEventListener('submit', async event => {
+                  event.preventDefault();
+                  const input = document.getElementById('title');
+                  status.textContent = '';
+                  try {
+                    const response = await fetch('/api/records', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ title: input.value })
+                    });
+                    if (!response.ok) throw new Error((await response.json()).error || 'Could not add record.');
+                    input.value = '';
+                    await loadRecords();
+                    status.textContent = 'Record saved.';
+                  } catch (error) { status.textContent = error.message; }
+                });
+                loadRecords().catch(error => { status.textContent = error.message; });
+              </script>
+            </body>
+            </html>
+            HTML
+            cat > /etc/nginx/conf.d/3tier.conf <<'NGINX'
+            server {
+              listen 80 default_server;
+              server_name _;
+              root /usr/share/nginx/html;
+              index index.html;
+              location /api/ {
+                proxy_pass http://10.0.2.13:3000;
+                proxy_http_version 1.1;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              }
+            }
+            NGINX
+            rm -f /etc/nginx/conf.d/welcome.conf
+            nginx -t
+            systemctl enable --now nginx
+      Tags:
+        - Key: Name
+          Value: ostad-3tier-web
+
+Outputs:
+  WebURL:
+    Description: Public Nginx application URL.
+    Value: !Sub http://${WebInstance.PublicIp}
+  WebPublicIp:
+    Description: Public IPv4 address of the Nginx web instance.
+    Value: !GetAtt WebInstance.PublicIp
+  WebInstanceId:
+    Value: !Ref WebInstance
+  AppInstanceId:
+    Value: !Ref AppInstance
+  DatabaseInstanceId:
+    Value: !Ref DatabaseInstance
+  NatGatewayId:
+    Value: !Ref NatGateway
+  WebSecurityGroupId:
+    Value: !Ref WebSecurityGroup
+  AppSecurityGroupId:
+    Value: !Ref AppSecurityGroup
+  DatabaseSecurityGroupId:
+    Value: !Ref DatabaseSecurityGroup
