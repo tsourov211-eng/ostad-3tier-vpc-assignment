@@ -98,43 +98,43 @@ flowchart LR
 ## 5. Verification Screenshots
 
 ### A. Custom VPC & Subnets
-![Custom VPC](01-vpc-created.png)
+![Custom VPC](screenshots/01-vpc-created.png)
 *Figure 1: Custom VPC successfully created.*
 
-![Subnets Configuration](02-subnets-created.png)
+![Subnets Configuration](screenshots/02-subnets-created.png)
 *Figure 2: Public and Private Subnets across availability zones.*
 
-![Public Subnet Settings](03-public-subnet-settings.png)
+![Public Subnet Settings](screenshots/03-public-subnet-settings.png)
 *Figure 3: Public Subnet settings and auto-assign public IPv4 configuration.*
 
 ---
 
 ### B. Routing & NAT Gateway
-![Private Route Table via NAT](04-private-route-via-nat.png)
+![Private Route Table via NAT](screenshots/04-private-route-via-nat.png)
 *Figure 4: Private Route Table routing 0.0.0.0/0 outbound traffic through the NAT Gateway.*
 
 ---
 
 ### C. Security Groups Configuration
-![Security Groups Overview](08-security-groups.png)
+![Security Groups Overview](screenshots/08-security-groups.png)
 *Figure 5: Overview of Web, App, and Database Security Groups.*
 
-![Web Security Group Rules](09-web-security-group-rules.png)
+![Web Security Group Rules](screenshots/09-web-security-group-rules.png)
 *Figure 6: Web Security Group allowing inbound HTTP port 80 from anywhere.*
 
-![App Security Group Rules](10-app-security-group-rules.png)
+![App Security Group Rules](screenshots/10-app-security-group-rules.png)
 *Figure 7: App Security Group restricting inbound port 3000 exclusively to the Web Security Group.*
 
 ---
 
 ### D. EC2 Instances
-![EC2 Instances](07-ec2-instances.png)
+![EC2 Instances](screenshots/07-ec2-instances.png)
 *Figure 8: Running EC2 instances (Web in public subnet; App and Database in private subnets with private IPs only).*
 
 ---
 
 ### E. End-to-End Working Application
-![Working Application in Browser](05-working-todo-app.png)
+![Working Application in Browser](screenshots/05-working-todo-app.png)
 *Figure 9: To-Do Application accessed through Nginx public IP, showing successful record creation and persistence.*
 
 ---
@@ -142,7 +142,7 @@ flowchart LR
 ### F. Bonus: Infrastructure as Code Automation (+10 Marks)
 To achieve the bonus points, the deployment and setup of all three tiers are automated using an AWS CloudFormation template ([`cloudformation/3-tier.yaml`](cloudformation/3-tier.yaml)) with EC2 UserData automation scripts.
 
-![CloudFormation Stack Output](06-cloudformation-output.png)
+![CloudFormation Stack Output](screenshots/06-cloudformation-output.png)
 *Figure 10: Successful automated deployment via AWS CloudFormation with exported outputs.*
 
 ---
@@ -165,9 +165,10 @@ To achieve the bonus points, the deployment and setup of all three tiers are aut
 
 ---
 
-## 7. Cost & Resource Cleanup
+## 7. Conclusion
 
-> **Important Note:** To avoid unnecessary AWS charges (especially for NAT Gateway and EC2 instances), remember to clean up the environment after grading:
-1. Delete the CloudFormation stack or terminate the 3 EC2 instances.
-2. Delete the NAT Gateway and release the associated Elastic IP (EIP).
-3. Verify in the AWS Billing Dashboard that no active billable networking resources remain running.
+This project successfully implements a production-style, secure 3-tier web architecture on a custom AWS VPC:
+* **Strict Tier Isolation:** The database and backend application instances remain strictly protected within private subnets without direct internet exposure.
+* **Single Public Entry Point:** Nginx acts as the secure entry gateway, handling client requests and reverse-proxying API calls securely.
+* **High Availability & Persistence:** Systemd ensures the API stays running across reboots, and MariaDB ensures persistent data storage for all records.
+* **Automation:** Leveraging CloudFormation and EC2 UserData provides reproducible, error-free infrastructure deployment that fulfills the bonus criteria.
